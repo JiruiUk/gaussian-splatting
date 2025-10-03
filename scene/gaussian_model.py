@@ -52,8 +52,8 @@ class GaussianModel:
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
-        self._features_dc = torch.empty(0)
-        self._features_rest = torch.empty(0)
+        self._features_dc = torch.empty(0) # 高斯点的基础颜色，类似于漫反射颜色 # 不随视角变化 # 在分裂时，子点应该继承母点的基本颜色特性
+        self._features_rest = torch.empty(0) # Rest SH components # 高斯点的其余SH系数，控制视角依赖的颜色变化
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -156,13 +156,15 @@ class GaussianModel:
         # 2. SH特征
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
-        features[:, 3:, 1:] = 0.0
+        features[:, 3:, 1:] = 0.0 # 3: seems wrong change to :3
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         # 3. 尺度（基于点密度）
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        # distCUDA2 计算每个点到其最近邻点的平方距离
+        # clamp_min，确保距离不小于1e-7
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001) 
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3) # tensor[..., None] 在最后添加一个维度
 
          # 4. 旋转和透明度
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
@@ -185,8 +187,8 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") # 存储每个高斯点位置梯度的累积和
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") # 存储每个高斯点的梯度累积次数
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -369,9 +371,24 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
+        self.tmp_radii = self.tmp_radii[valid_points_mask] # tmp_radii 记录了每个3D高斯核在当前帧中投影到屏幕上形成的2D椭圆的近似半径（像素单位）
+
+
 
     def cat_tensors_to_optimizer(self, tensors_dict):
+        """
+        Concatenates additional tensors to the parameters managed by the optimizer and updates the optimizer's state accordingly.
+        For each parameter group in the optimizer, this method:
+        - Retrieves the corresponding extension tensor from `tensors_dict` using the group's name.
+        - Concatenates the extension tensor to the group's parameter tensor.
+        - If optimizer state (e.g., for Adam) exists for the parameter, extends the state tensors (`exp_avg`, `exp_avg_sq`) with zeros of appropriate shape.
+        - Replaces the parameter in the optimizer with the new concatenated tensor and updates the optimizer's state.
+        - Collects and returns the updated parameters in a dictionary keyed by group name.
+        Args:
+            tensors_dict (dict): A dictionary mapping parameter group names to tensors to be concatenated to the existing parameters.
+        Returns:
+            dict: A dictionary mapping parameter group names to the updated parameter tensors.
+        """
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
@@ -394,6 +411,23 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+        """
+        Updates the model's internal state after densification by concatenating new parameters
+        (such as positions, features, opacities, scaling, and rotation) to the existing tensors.
+        Also updates temporary radii and resets gradient accumulators and related buffers.
+        Args:
+            new_xyz (torch.Tensor): New 3D coordinates to be added.
+            new_features_dc (torch.Tensor): New direct color features to be added.
+            new_features_rest (torch.Tensor): New additional features to be added.
+            new_opacities (torch.Tensor): New opacity values to be added.
+            new_scaling (torch.Tensor): New scaling factors to be added.
+            new_rotation (torch.Tensor): New rotation parameters to be added.
+            new_tmp_radii (torch.Tensor): New temporary radii to be concatenated.
+        Side Effects:
+            - Updates internal tensors for xyz, features, opacity, scaling, and rotation.
+            - Concatenates new_tmp_radii to self.tmp_radii.
+            - Resets xyz_gradient_accum, denom, and max_radii2D buffers on CUDA device.
+        """
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -415,25 +449,33 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
-        n_init_points = self.get_xyz.shape[0]
+        n_init_points = self.get_xyz.shape[0] # number of gaussian
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
+
+        # 梯度阈值
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        # 尺度阈值
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
+        stds = self.get_scaling[selected_pts_mask].repeat(N,1) # N 为要分裂的个数
         means =torch.zeros((stds.size(0), 3),device="cuda")
-        samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
-        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
-        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
-        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
-        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+
+        samples = torch.normal(mean=means, std=stds) # 生成随机偏差 (局部坐标系)
+
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1) #复制旋转矩阵，高斯点旋转矩阵，控制高斯椭球的方向	
+
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1) # 新的高斯点位置
+
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N)) # 新的优化尺度，范围 正负无穷
+
+        new_rotation = self._rotation[selected_pts_mask].repeat(N,1) # 旋转矩阵不变
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1) # 基础颜色不变
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1) #  其余SH系数不变，完全继承母点的所有高阶球谐系数。
+        new_opacity = self._opacity[selected_pts_mask].repeat(N,1) # 透明度不变
+        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N) # 投影半径不变
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
 
@@ -477,5 +519,6 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
+        # only the gaussian point that is visible in the current view will be updated
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
